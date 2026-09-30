@@ -1,9 +1,11 @@
 #!/usr/bin/env node
 // Claude Changes – PreToolUse snapshot hook.
 //
-// Installed as <workspace>/.claude/hooks/claude-changes-snapshot.js and run by Claude Code before
-// every Edit / Write / MultiEdit / NotebookEdit. It records the ORIGINAL content of each file the first
-// time Claude touches it, so the Claude Changes VS Code extension can show a diff and undo it.
+// Installed as <workspace>/.claude/hooks/claude-changes-snapshot.js and run by Claude Code:
+//   • PreToolUse  Edit / Write / MultiEdit / NotebookEdit – snapshot that file before its first edit;
+//   • PreToolUse / PostToolUse  Bash / PowerShell, and Stop – detect files a shell command changed.
+// It records the ORIGINAL content of each file the first time Claude touches it, so the Claude Changes
+// VS Code extension can show a diff and undo it.
 //
 // Zero dependencies, cross-platform. It must never block Claude: it always exits 0, never writes to
 // stdout, and logs problems to <workspace>/.claude/review/hook.log.
@@ -109,7 +111,7 @@ function sleepSync(ms) {
 }
 
 /** One attempt at taking the lock. Breaks stale locks. Returns true when acquired. */
-function tryAcquireLock(lockPath) {
+function tryAcquireLock(lockPath, staleMs = LOCK_STALE_MS) {
   try {
     const fd = fs.openSync(lockPath, 'wx');
     try {
@@ -122,7 +124,7 @@ function tryAcquireLock(lockPath) {
     if (!err || err.code !== 'EEXIST') throw err;
     try {
       const age = Date.now() - fs.statSync(lockPath).mtimeMs;
-      if (age > LOCK_STALE_MS) fs.rmSync(lockPath, { force: true });
+      if (age > staleMs) fs.rmSync(lockPath, { force: true });
     } catch {
       /* lock vanished between open and stat: just retry */
     }
@@ -138,20 +140,24 @@ function releaseLock(lockPath) {
   }
 }
 
-/** Run `fn` while holding the manifest lock (synchronous; used by the hook). */
-function withLockSync(root, fn, timeoutMs = LOCK_TIMEOUT_MS) {
-  const p = reviewPaths(root);
-  fs.mkdirSync(p.dir, { recursive: true });
+/** Run `fn` while holding the lock file `lockPath` (synchronous). */
+function withFileLockSync(lockPath, fn, timeoutMs = LOCK_TIMEOUT_MS, staleMs = LOCK_STALE_MS) {
+  fs.mkdirSync(path.dirname(lockPath), { recursive: true });
   const deadline = Date.now() + timeoutMs;
-  while (!tryAcquireLock(p.lock)) {
-    if (Date.now() > deadline) throw new Error('timed out waiting for manifest lock');
+  while (!tryAcquireLock(lockPath, staleMs)) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${path.basename(lockPath)}`);
     sleepSync(LOCK_RETRY_MS);
   }
   try {
     return fn();
   } finally {
-    releaseLock(p.lock);
+    releaseLock(lockPath);
   }
+}
+
+/** Run `fn` while holding the manifest lock (synchronous; used by the hook). */
+function withLockSync(root, fn, timeoutMs = LOCK_TIMEOUT_MS) {
+  return withFileLockSync(reviewPaths(root).lock, fn, timeoutMs);
 }
 
 /** Run async `fn` while holding the manifest lock (used by the extension; never blocks the thread). */
@@ -357,6 +363,273 @@ function recordSnapshot(root, filePath, opts = {}) {
   });
 }
 
+// ---------------------------------------------------------------------------------------------
+// Shell commands (Bash / PowerShell)
+//
+// A shell command can change any file, so its originals can't be captured on demand. Instead we keep
+// an incremental, content-addressed cache of the workspace (.claude/review/cache): before each shell
+// command the cache is brought up to date (only files whose size/mtime/inode changed are re-read);
+// after it, the workspace is compared against the cache and every file that was changed, created or
+// deleted – and isn't tracked yet – gets a manifest entry whose original comes from the cache.
+// If PostToolUse never arrives (e.g. the command failed), the next shell command or the end of the
+// turn (Stop) does the comparison instead.
+// ---------------------------------------------------------------------------------------------
+
+const SHELL_TOOLS = new Set(['Bash', 'PowerShell']);
+const SCAN_MAX_FILE_BYTES = 5 * 1024 * 1024;
+const SCAN_MAX_FILES = 20000;
+const SCAN_MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const SCAN_DEADLINE_MS = 7000;
+const CACHE_LOCK_STALE_MS = 30000;
+const CACHE_LOCK_TIMEOUT_MS = 8000;
+const WALK_EXCLUDES = new Set([
+  '.git', '.hg', '.svn', 'node_modules', 'bower_components', '__pycache__', '.venv', 'venv', '.tox',
+  '.mypy_cache', '.pytest_cache', '.next', '.nuxt', '.turbo', '.parcel-cache', '.gradle', 'target',
+  '.idea', '.vscode-test', 'coverage', '.cache',
+]);
+
+function cachePaths(root) {
+  const dir = path.join(root, REVIEW_DIR, 'cache');
+  return {
+    dir,
+    blobs: path.join(dir, 'blobs'),
+    index: path.join(dir, 'index.json'),
+    state: path.join(dir, 'state.json'),
+    lock: path.join(dir, 'cache.lock'),
+  };
+}
+
+function readJsonFile(p, fallback) {
+  try {
+    const v = JSON.parse(fs.readFileSync(p, 'utf8'));
+    return v && typeof v === 'object' ? v : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function isReviewPath(rel) {
+  return rel === REVIEW_DIR || rel.startsWith(REVIEW_DIR + '/');
+}
+
+/**
+ * Relative (forward-slash) paths of the files to watch. In a git work tree: tracked + untracked,
+ * not ignored (so .gitignore is respected). Otherwise a directory walk with common heavy dirs skipped.
+ * Returns { files, complete } – complete is false when a limit was hit.
+ */
+function listWorkspaceFiles(root) {
+  let files;
+  try {
+    const cp = require('child_process');
+    const res = cp.spawnSync('git', ['-C', root, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], {
+      encoding: 'utf8',
+      timeout: 3000,
+      windowsHide: true,
+      maxBuffer: 64 * 1024 * 1024,
+    });
+    if (res.status === 0 && typeof res.stdout === 'string') {
+      files = [...new Set(res.stdout.split('\0').filter(Boolean))];
+    }
+  } catch {
+    files = undefined;
+  }
+  let complete = true;
+  if (!files) {
+    files = [];
+    const stack = [''];
+    while (stack.length) {
+      const relDir = stack.pop();
+      let dirents;
+      try {
+        dirents = fs.readdirSync(path.join(root, relDir), { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const d of dirents) {
+        const rel = relDir ? `${relDir}/${d.name}` : d.name;
+        if (d.isDirectory()) {
+          if (!WALK_EXCLUDES.has(d.name) && !isReviewPath(rel)) stack.push(rel);
+        } else if (d.isFile()) {
+          files.push(rel);
+        }
+      }
+      if (files.length > SCAN_MAX_FILES) break;
+    }
+  }
+  files = files.filter((f) => !isReviewPath(f));
+  if (files.length > SCAN_MAX_FILES) {
+    files = files.slice(0, SCAN_MAX_FILES);
+    complete = false;
+  }
+  return { files, complete };
+}
+
+function statSignature(st) {
+  return `${st.size}:${Math.round(st.mtimeMs * 1000)}:${st.ino}`;
+}
+
+function storeBlob(blobsDir, data) {
+  const hash = crypto.createHash('sha1').update(data).digest('hex');
+  const p = path.join(blobsDir, hash);
+  if (!fs.existsSync(p)) writeFileAtomic(p, data);
+  return hash;
+}
+
+/**
+ * Bring the cache index up to date with the workspace. When `record` is set, files that differ from
+ * the cache are returned as changes: { rel, kind: 'modified' | 'created' | 'deleted', originalHash }.
+ */
+function syncCache(root, record) {
+  const cp = cachePaths(root);
+  const started = Date.now();
+  const prev = readJsonFile(cp.index, undefined);
+  const hadIndex = !!(prev && prev.files && typeof prev.files === 'object');
+  const oldFiles = hadIndex ? prev.files : {};
+  // New-file detection is only trustworthy when the previous index covered the whole workspace.
+  const detectCreated = record && hadIndex && prev.complete === true;
+  const { files, complete: listed } = listWorkspaceFiles(root);
+  const next = {};
+  const changes = [];
+  let complete = listed;
+  let totalBytes = 0;
+
+  fs.mkdirSync(cp.blobs, { recursive: true });
+  for (const rel of files) {
+    const old = oldFiles[rel];
+    if (Date.now() - started > SCAN_DEADLINE_MS) {
+      complete = false;
+      if (old) next[rel] = old;
+      continue;
+    }
+    let st;
+    try {
+      st = fs.statSync(path.join(root, rel));
+    } catch {
+      continue; // listed but gone (e.g. deleted tracked file) – handled as "missing" below
+    }
+    if (!st.isFile()) continue;
+    const sig = statSignature(st);
+    if (old && old.sig === sig) {
+      next[rel] = old;
+      continue;
+    }
+    if (st.size > SCAN_MAX_FILE_BYTES || totalBytes + st.size > SCAN_MAX_TOTAL_BYTES) {
+      next[rel] = { sig, hash: null };
+      if (st.size <= SCAN_MAX_FILE_BYTES) complete = false;
+      if (record && old && old.hash) changes.push({ rel, kind: 'modified', originalHash: old.hash });
+      continue;
+    }
+    let data;
+    try {
+      data = fs.readFileSync(path.join(root, rel));
+    } catch {
+      continue;
+    }
+    totalBytes += data.length;
+    const hash = storeBlob(cp.blobs, data);
+    next[rel] = { sig, hash };
+    if (!record) continue;
+    if (old) {
+      if (old.hash && old.hash !== hash) changes.push({ rel, kind: 'modified', originalHash: old.hash });
+    } else if (detectCreated) {
+      changes.push({ rel, kind: 'created', originalHash: null });
+    }
+  }
+  if (record) {
+    for (const rel of Object.keys(oldFiles)) {
+      if (next[rel] || !oldFiles[rel].hash) continue;
+      if (fs.existsSync(path.join(root, rel))) {
+        next[rel] = oldFiles[rel]; // exists but wasn't listed (e.g. became git-ignored): keep as is
+        continue;
+      }
+      changes.push({ rel, kind: 'deleted', originalHash: oldFiles[rel].hash });
+    }
+  }
+
+  writeFileAtomic(cp.index, JSON.stringify({ version: 1, complete, files: next }));
+  // Garbage-collect blobs nothing refers to any more (originals/ holds its own copies).
+  const live = new Set(Object.values(next).map((e) => e.hash).filter(Boolean));
+  for (const c of changes) if (c.originalHash) live.add(c.originalHash);
+  try {
+    for (const b of fs.readdirSync(cp.blobs)) {
+      if (!live.has(b) && !b.includes('.tmp-')) fs.rmSync(path.join(cp.blobs, b), { force: true });
+    }
+  } catch {
+    /* ignore */
+  }
+  if (!complete) log(root, 'warn', `workspace cache is partial (${files.length} files listed); shell changes to some files may be missed`);
+  return changes;
+}
+
+/** Add manifest entries for shell-command changes (files already tracked keep their first original). */
+function recordShellChanges(root, changes, opts = {}) {
+  if (!changes.length) return [];
+  const platform = opts.platform || process.platform;
+  const now = opts.now || Date.now;
+  const cp = cachePaths(root);
+  const p = reviewPaths(root);
+  return withLockSync(root, () => {
+    const { manifest, warning } = readManifest(root);
+    if (warning) log(root, 'warn', warning);
+    const added = [];
+    for (const c of changes) {
+      const abs = normalizePath(path.join(root, c.rel), platform);
+      if (findEntry(manifest, abs, platform)) continue;
+      let entry;
+      if (c.originalHash) {
+        const name = snapshotName(abs, platform);
+        fs.mkdirSync(p.originals, { recursive: true });
+        const tmp = path.join(p.originals, `${name}.tmp-${process.pid}`);
+        fs.copyFileSync(path.join(cp.blobs, c.originalHash), tmp);
+        renameWithRetry(tmp, path.join(p.originals, name));
+        entry = { path: abs, snapshot: name, isNew: false, timestamp: now() };
+      } else {
+        entry = { path: abs, snapshot: null, isNew: true, timestamp: now() };
+      }
+      manifest.files.push(entry);
+      added.push(entry);
+    }
+    if (added.length) writeManifestAtomic(root, manifest);
+    return added;
+  });
+}
+
+function withCacheLock(root, fn) {
+  return withFileLockSync(cachePaths(root).lock, fn, CACHE_LOCK_TIMEOUT_MS, CACHE_LOCK_STALE_MS);
+}
+
+function setInFlight(root, value) {
+  const cp = cachePaths(root);
+  const state = readJsonFile(cp.state, {});
+  state.inFlight = value;
+  writeFileAtomic(cp.state, JSON.stringify(state));
+}
+
+function isInFlight(root) {
+  return !!readJsonFile(cachePaths(root).state, {}).inFlight;
+}
+
+/** PreToolUse(Bash): settle an unfinished command if any, refresh the cache, mark a command in flight. */
+function beforeShellCommand(root, opts = {}) {
+  return withCacheLock(root, () => {
+    const pending = isInFlight(root);
+    const changes = syncCache(root, pending);
+    const added = recordShellChanges(root, changes, opts);
+    setInFlight(root, Date.now());
+    return added;
+  });
+}
+
+/** PostToolUse(Bash) / Stop: record what the command(s) changed. */
+function afterShellCommand(root, opts = {}) {
+  return withCacheLock(root, () => {
+    if (!opts.force && !isInFlight(root)) return [];
+    const added = recordShellChanges(root, syncCache(root, true), opts);
+    setInFlight(root, null);
+    return added;
+  });
+}
+
 /** Extract the file path from a PreToolUse payload (Edit/Write/MultiEdit use file_path, NotebookEdit notebook_path). */
 function filePathFromInput(input) {
   const ti = input && input.tool_input;
@@ -383,6 +656,19 @@ function resolveRoot(scriptPath, env, input) {
 }
 
 function handleHookInput(input, root, opts = {}) {
+  const event = input && input.hook_event_name;
+  const tool = input && input.tool_name;
+  const isShell = SHELL_TOOLS.has(tool);
+  if (event === 'Stop' || event === 'SubagentStop') {
+    return { result: 'shell', entries: afterShellCommand(root, opts) };
+  }
+  if (isShell && (event === 'PostToolUse' || event === 'PostToolUseFailure')) {
+    return { result: 'shell', entries: afterShellCommand(root, opts) };
+  }
+  if (isShell) {
+    return { result: 'shell', entries: beforeShellCommand(root, opts) };
+  }
+  if (event && event !== 'PreToolUse') return { result: 'ignored', reason: `event ${event}` };
   const filePath = filePathFromInput(input);
   return recordSnapshot(root, filePath, { ...opts, cwd: input && input.cwd });
 }
@@ -422,7 +708,7 @@ async function main() {
     }
     const res = handleHookInput(input, root);
     if (process.env.CLAUDE_CHANGES_DEBUG) {
-      log(root, 'debug', `${input.tool_name || '?'} ${filePathFromInput(input) || '?'} -> ${res.result}${res.reason ? ` (${res.reason})` : ''}`);
+      log(root, 'debug', `${input.tool_name || '?'} ${filePathFromInput(input) || '?'} -> ${res.result}${res.reason ? ` (${res.reason})` : ''}${res.entries ? ` (+${res.entries.length})` : ''}`);
     }
   } catch (err) {
     if (root) log(root, 'error', (err && err.stack) || String(err));
@@ -441,6 +727,7 @@ module.exports = {
   log,
   withLock,
   withLockSync,
+  withFileLockSync,
   readManifest,
   writeFileAtomic,
   writeManifestAtomic,
@@ -451,6 +738,12 @@ module.exports = {
   resolveRoot,
   handleHookInput,
   emptyManifest,
+  SHELL_TOOLS,
+  cachePaths,
+  listWorkspaceFiles,
+  syncCache,
+  beforeShellCommand,
+  afterShellCommand,
 };
 
 if (require.main === module) {

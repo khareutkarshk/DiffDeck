@@ -23,7 +23,8 @@ export interface ReviewPaths {
 }
 
 export interface RecordResult {
-  result: 'added' | 'exists' | 'ignored';
+  result: 'added' | 'exists' | 'ignored' | 'shell';
+  entries?: ManifestEntry[];
   reason?: string;
   path?: string;
   entry?: ManifestEntry;
@@ -61,3 +62,15 @@ export function filePathFromInput(input: unknown): string | undefined;
 export function resolveRoot(scriptPath: string, env: Record<string, string | undefined>, input: unknown): string | undefined;
 export function handleHookInput(input: unknown, root: string, opts?: RecordOptions): RecordResult;
 export function emptyManifest(): Manifest;
+export function withFileLockSync<T>(lockPath: string, fn: () => T, timeoutMs?: number, staleMs?: number): T;
+export const SHELL_TOOLS: Set<string>;
+export function cachePaths(root: string): { dir: string; blobs: string; index: string; state: string; lock: string };
+export function listWorkspaceFiles(root: string): { files: string[]; complete: boolean };
+export interface ShellChange {
+  rel: string;
+  kind: 'modified' | 'created' | 'deleted';
+  originalHash: string | null;
+}
+export function syncCache(root: string, record: boolean): ShellChange[];
+export function beforeShellCommand(root: string, opts?: RecordOptions): ManifestEntry[];
+export function afterShellCommand(root: string, opts?: RecordOptions & { force?: boolean }): ManifestEntry[];

@@ -1,12 +1,14 @@
-// Merging the Claude Changes PreToolUse hook into <workspace>/.claude/settings.json, and the matching
-// .gitignore entry. Pure logic – no `vscode` import – so it can be unit-tested.
+// Merging the Claude Changes hooks into <workspace>/.claude/settings.json, and the matching .gitignore
+// entry. Pure logic – no `vscode` import – so it can be unit-tested.
 //
-// Rules: never drop or reorder anything that is already there, never add a duplicate handler, and
-// refuse to touch a settings file we can't parse (rather than overwriting it).
+// Rules: never drop or reorder anything that is not ours, never add a duplicate handler, and refuse
+// to touch a settings file we can't parse (rather than overwriting it).
 
 export const HOOK_SCRIPT_REL = '.claude/hooks/claude-changes-snapshot.js';
 export const HOOK_MARKER = 'claude-changes-snapshot.js';
-export const HOOK_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit';
+/** File-editing tools are snapshotted per file; shell tools via the workspace cache (see the hook). */
+export const HOOK_MATCHER = 'Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell';
+export const SHELL_MATCHER = 'Bash|PowerShell';
 export const GITIGNORE_ENTRY = '.claude/review/';
 export const GITIGNORE_COMMENT = '# Claude Changes review data (snapshots of files before Claude edited them)';
 
@@ -23,12 +25,22 @@ export interface HookHandler {
  * Code releases – older ones silently run `command` without the args. In shell form, newer releases
  * substitute ${CLAUDE_PROJECT_DIR} themselves and older ones leave it to the shell, which expands the
  * environment variable of the same name; the quotes keep paths with spaces intact either way.
+ * The script limits its own run time; the timeout is only a backstop.
  */
 export function ourHandler(): HookHandler {
   return {
     type: 'command',
     command: 'node "${CLAUDE_PROJECT_DIR}/' + HOOK_SCRIPT_REL + '"',
-    timeout: 10,
+    timeout: 30,
+  };
+}
+
+/** The groups we install, per hook event. */
+export function ourGroups(): Record<string, Record<string, unknown>> {
+  return {
+    PreToolUse: { matcher: HOOK_MATCHER, hooks: [ourHandler()] },
+    PostToolUse: { matcher: SHELL_MATCHER, hooks: [ourHandler()] },
+    Stop: { hooks: [ourHandler()] },
   };
 }
 
@@ -51,7 +63,7 @@ export function parseSettings(text: string | undefined): ParseResult {
   if (text === undefined || text.trim() === '') return { ok: true, settings: {}, indent: 2 };
   let data: unknown;
   try {
-    data = JSON.parse(text.replace(/^﻿/, ''));
+    data = JSON.parse(text.replace(/^\uFEFF/, ''));
   } catch (err) {
     return { ok: false, error: `settings.json is not valid JSON (${(err as Error).message})` };
   }
@@ -59,9 +71,13 @@ export function parseSettings(text: string | undefined): ParseResult {
   if (data.hooks !== undefined && !isObject(data.hooks)) {
     return { ok: false, error: '"hooks" in settings.json is not an object' };
   }
-  const pre = isObject(data.hooks) ? data.hooks.PreToolUse : undefined;
-  if (pre !== undefined && !Array.isArray(pre)) {
-    return { ok: false, error: '"hooks.PreToolUse" in settings.json is not an array' };
+  if (isObject(data.hooks)) {
+    for (const event of Object.keys(ourGroups())) {
+      const v = data.hooks[event];
+      if (v !== undefined && !Array.isArray(v)) {
+        return { ok: false, error: `"hooks.${event}" in settings.json is not an array` };
+      }
+    }
   }
   return { ok: true, settings: data, indent: detectIndent(text) };
 }
@@ -76,66 +92,69 @@ function isOurHandler(h: unknown): boolean {
   return parts.some((p) => typeof p === 'string' && p.includes(HOOK_MARKER));
 }
 
-function preToolUse(settings: Json): unknown[] | undefined {
-  const hooks = settings.hooks;
-  if (!isObject(hooks) || !Array.isArray(hooks.PreToolUse)) return undefined;
-  return hooks.PreToolUse;
-}
-
-export function isHookInstalled(settings: Json): boolean {
-  const groups = preToolUse(settings);
-  if (!groups) return false;
-  return groups.some((g) => isObject(g) && Array.isArray(g.hooks) && g.hooks.some(isOurHandler));
+function hasOurHandler(g: unknown): boolean {
+  return isObject(g) && Array.isArray(g.hooks) && g.hooks.some(isOurHandler);
 }
 
 function sameJson(a: unknown, b: unknown): boolean {
   return JSON.stringify(a) === JSON.stringify(b);
 }
 
+export function isHookInstalled(settings: Json): boolean {
+  const hooks = settings.hooks;
+  if (!isObject(hooks)) return false;
+  return Object.values(hooks).some((groups) => Array.isArray(groups) && groups.some(hasOurHandler));
+}
+
+/** Remove our handler from `groups`, dropping groups that only contained it. */
+function stripOurs(groups: unknown[]): unknown[] {
+  return groups
+    .map((g) => {
+      if (!hasOurHandler(g)) return g;
+      const remaining = (g as { hooks: unknown[] }).hooks.filter((h) => !isOurHandler(h));
+      return remaining.length ? { ...(g as Json), hooks: remaining } : undefined;
+    })
+    .filter((g) => g !== undefined);
+}
+
 /**
- * Add our PreToolUse group, or bring an existing handler of ours up to date in place (keeping its
- * position and any extra fields the user added). Returns a new object; the input is not mutated.
+ * Make settings contain exactly our groups (see ourGroups). A group of ours that is already exactly
+ * right is left in place; anything else of ours (older versions, other events) is removed and the
+ * current group appended. Returns a new object; the input is not mutated.
  */
 export function addHook(settings: Json): { settings: Json; changed: boolean } {
-  if (isHookInstalled(settings)) {
-    const next = structuredClone(settings);
-    let changed = false;
-    for (const g of preToolUse(next) ?? []) {
-      if (!isObject(g) || !Array.isArray(g.hooks)) continue;
-      g.hooks = g.hooks.map((h) => {
-        if (!isOurHandler(h)) return h;
-        const { args: _args, ...rest } = h as Json;
-        const updated = { ...rest, ...ourHandler() };
-        if (sameJson(updated, h)) return h;
-        changed = true;
-        return updated;
-      });
-    }
-    return changed ? { settings: next, changed } : { settings, changed: false };
-  }
+  const wanted = ourGroups();
   const next = structuredClone(settings);
   const hooks: Json = isObject(next.hooks) ? next.hooks : {};
-  const groups: unknown[] = Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : [];
-  groups.push({ matcher: HOOK_MATCHER, hooks: [ourHandler()] });
-  hooks.PreToolUse = groups;
+  let changed = false;
+  for (const event of new Set([...Object.keys(hooks), ...Object.keys(wanted)])) {
+    const current = Array.isArray(hooks[event]) ? (hooks[event] as unknown[]) : [];
+    const mine = current.filter(hasOurHandler);
+    const want = wanted[event];
+    if (want && mine.length === 1 && sameJson(mine[0], want)) continue;
+    if (!want && mine.length === 0) continue;
+    const kept = stripOurs(current);
+    if (want) kept.push(want);
+    if (kept.length) hooks[event] = kept;
+    else delete hooks[event];
+    changed = true;
+  }
+  if (!changed) return { settings, changed: false };
   next.hooks = hooks;
   return { settings: next, changed: true };
 }
 
-/** Remove only our handler; prune groups/arrays/objects that become empty because of it. */
+/** Remove only our handlers; prune groups/arrays/objects that become empty because of it. */
 export function removeHook(settings: Json): { settings: Json; changed: boolean } {
   if (!isHookInstalled(settings)) return { settings, changed: false };
   const next = structuredClone(settings);
   const hooks = next.hooks as Json;
-  const groups = (hooks.PreToolUse as unknown[])
-    .map((g) => {
-      if (!isObject(g) || !Array.isArray(g.hooks) || !g.hooks.some(isOurHandler)) return g;
-      const remaining = g.hooks.filter((h) => !isOurHandler(h));
-      return remaining.length ? { ...g, hooks: remaining } : undefined;
-    })
-    .filter((g) => g !== undefined);
-  if (groups.length) hooks.PreToolUse = groups;
-  else delete hooks.PreToolUse;
+  for (const event of Object.keys(hooks)) {
+    if (!Array.isArray(hooks[event])) continue;
+    const kept = stripOurs(hooks[event] as unknown[]);
+    if (kept.length) hooks[event] = kept;
+    else delete hooks[event];
+  }
   if (Object.keys(hooks).length === 0) delete next.hooks;
   return { settings: next, changed: true };
 }

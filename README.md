@@ -26,46 +26,68 @@ Then, in each project where you use Claude Code:
 ## How it works
 
 ```
-Claude Code ──PreToolUse(Edit|Write|MultiEdit|NotebookEdit)──▶ .claude/hooks/claude-changes-snapshot.js
-                                                                   │  first time a file is touched:
-                                                                   ▼
+Claude Code ── PreToolUse  Edit|Write|MultiEdit|NotebookEdit ──┐
+            ── PreToolUse / PostToolUse  Bash|PowerShell ──────┼─▶ .claude/hooks/claude-changes-snapshot.js
+            ── Stop ───────────────────────────────────────────┘        │  first time a file changes:
+                                                                        ▼
                                                .claude/review/manifest.json   (tracked files)
                                                .claude/review/originals/<sha1> (original contents)
-                                                                   │  FileSystemWatcher
-                                                                   ▼
+                                                                        │  FileSystemWatcher
+                                                                        ▼
                                             VS Code extension: panel · inline diff · Keep / Undo
 ```
 
-**The hook** (`hook/snapshot.js`) is plain Node.js with no dependencies. Before Claude's first edit
-to a file, it copies the file into `originals/`. A file that doesn't exist yet is recorded as *new*.
-Later edits to the same file are ignored, so the snapshot stays the true original until you Keep or
-Undo.
+**The hook** (`hook/snapshot.js`) is plain Node.js with no dependencies. It records the original of
+each file the first time Claude changes it. Later changes to the same file are ignored, so the
+snapshot stays the true original until you Keep or Undo.
 
-- The manifest is written atomically (temp file + rename) while holding a lock file, because Claude
-  Code runs matching hooks in parallel and a rename alone would lose concurrent updates.
-- The hook always exits 0 and never writes to stdout, so it can't block Claude. Errors go to
-  `.claude/review/hook.log`; set `CLAUDE_CHANGES_DEBUG=1` to log every call.
-- Files outside the workspace and anything under `.claude/review/` are ignored.
+- **Edit / Write / MultiEdit / NotebookEdit.** Before the edit, the hook copies the file into
+  `originals/`. A file that doesn't exist yet is recorded as *new*.
+- **Bash / PowerShell** (`sed -i`, `python` scripts, code generators, `rm`, …). A shell command can
+  touch any file, so the hook keeps an incremental cache of the workspace in
+  `.claude/review/cache/`:
+  - **Before each command,** it refreshes the cache. Only files whose size, mtime or inode changed
+    are re-read, and identical contents are stored once.
+  - **After the command,** it compares the workspace against the cache. Every file that was
+    modified, created or deleted gets an entry, with its pre-command content as the original.
+  - **If `PostToolUse` never arrives** (for example, the command failed), the next command or the
+    end of the turn (`Stop`) does the comparison instead.
+  - **Edits you make between Claude's commands** are not attributed to Claude.
+  - **Which files are scanned:** in a git work tree, the tracked and untracked files that aren't
+    git-ignored. Otherwise a directory walk that skips `node_modules`, `.git`, `.venv`, `target` and
+    similar folders.
+  - **Cost:** about 100 ms per command on a 10,000-file workspace once the cache is warm. The first
+    command pays about 1 s to fill the cache.
+- **Concurrency.** The manifest is written atomically (temp file + rename) while holding a lock
+  file, because Claude Code runs matching hooks in parallel and a rename alone would lose
+  concurrent updates.
+- **Never blocks Claude.** The hook always exits 0 and never writes to stdout. Errors and warnings
+  go to `.claude/review/hook.log`; set `CLAUDE_CHANGES_DEBUG=1` to log every call.
+- **Ignored:** files outside the workspace and anything under `.claude/review/`.
 
 **The install command**:
 
 - copies the hook to `.claude/hooks/claude-changes-snapshot.js`;
-- *merges* this entry into `.claude/settings.json`, leaving your other settings and hooks alone and
-  never adding a duplicate:
+- *merges* these entries into `.claude/settings.json`, leaving your other settings and hooks alone
+  and never adding a duplicate:
 
   ```json
-  { "hooks": { "PreToolUse": [ { "matcher": "Edit|Write|MultiEdit|NotebookEdit",
-      "hooks": [ { "type": "command",
-                   "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-changes-snapshot.js\"",
-                   "timeout": 10 } ] } ] } }
+  { "hooks": {
+      "PreToolUse":  [ { "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell", "hooks": [ H ] } ],
+      "PostToolUse": [ { "matcher": "Bash|PowerShell", "hooks": [ H ] } ],
+      "Stop":        [ { "hooks": [ H ] } ] } }
+
+  H = { "type": "command",
+        "command": "node \"${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-changes-snapshot.js\"",
+        "timeout": 30 }
   ```
 
   This uses shell form on purpose. The newer exec form (`command` + `args`) is silently ignored by
   older Claude Code releases; 2.1.76 was tested. In shell form, newer releases substitute
   `${CLAUDE_PROJECT_DIR}` themselves, and older ones leave it to the shell, which expands the
-  environment variable of the same name. The quotes keep paths with spaces working. This entry was
-  verified end-to-end with Claude Code 2.1.76 and 2.1.285. Re-running the install command updates
-  an older entry of ours in place.
+  environment variable of the same name. The quotes keep paths with spaces working. This setup was
+  verified end-to-end with Claude Code 2.1.76 and 2.1.285. Re-running the install command replaces
+  older entries of ours; the extension offers this when it finds one.
 - adds `.claude/review/` to `.gitignore` if the project has one.
 
 If `settings.json` isn't valid JSON, the install stops and changes nothing.
@@ -155,10 +177,13 @@ You can rebind any of them in *Keyboard Shortcuts* (search for "Claude Changes")
 
 ## Limitations
 
-- **Only Edit / Write / MultiEdit / NotebookEdit are captured.** Changes Claude makes through
-  **Bash** (`sed -i`, `mv`, code generators, `git checkout`, …), PowerShell, or MCP tools don't go
-  through these tools, so they aren't snapshotted. Neither are files changed outside the workspace
-  folder.
+- **What is captured.** Edit / Write / MultiEdit / NotebookEdit and Bash / PowerShell commands.
+  Not captured:
+  - files changed by **MCP tools**;
+  - files outside the workspace folder;
+  - for shell commands, git-ignored files (in a git repo) and files over 5 MB;
+  - changes a **background** command (`run_in_background`, dev servers, watchers) makes after its
+    tool call has returned.
 - **Rejected edits.** `PreToolUse` runs before the permission prompt, so a rejected edit can leave
   an entry with no changes. Such entries are hidden. **Refresh** prunes them once they're older than
   10 minutes; they aren't pruned sooner so they can't race an edit that is still waiting for

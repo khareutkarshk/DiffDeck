@@ -2,7 +2,7 @@
   "name": "claude-changes",
   "displayName": "Claude Changes",
   "description": "Cursor-style review panel for files edited by Claude Code: inline red/green diffs with Keep/Undo per hunk, per file, and for everything.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {

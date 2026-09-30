@@ -272,3 +272,132 @@ describe('hook process', () => {
     expect(fs.existsSync(path.join(root, '.claude/review/hook.log'))).toBe(false);
   });
 });
+
+describe('shell commands (Bash / PowerShell)', () => {
+  const bash = (event: string) => ({ hook_event_name: event, tool_name: 'Bash', tool_input: { command: 'x' }, cwd: root });
+  const write = (rel: string, content: string) => {
+    fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    fs.writeFileSync(path.join(root, rel), content);
+  };
+  const entries = () =>
+    (fs.existsSync(path.join(root, '.claude/review/manifest.json')) ? manifest().files : []) as {
+      path: string;
+      snapshot: string | null;
+      isNew: boolean;
+    }[];
+  const original = (e: { snapshot: string | null }) =>
+    fs.readFileSync(path.join(root, '.claude/review/originals', e.snapshot!), 'utf8');
+  const byName = (name: string) => entries().find((e) => e.path.endsWith('/' + name));
+
+  beforeEach(() => {
+    write('a.txt', 'A original');
+    write('b.txt', 'B original');
+    write('sub/c.txt', 'C original');
+    write('node_modules/pkg/index.js', 'module');
+  });
+
+  it('records files a command modified, deleted and created, with their pre-command content', () => {
+    hook.handleHookInput(bash('PreToolUse'), root);
+    write('a.txt', 'A changed by sed');
+    fs.rmSync(path.join(root, 'b.txt'));
+    write('sub/d.txt', 'brand new');
+    write('node_modules/pkg/other.js', 'ignored dir');
+    // Touch without changing content: not a change.
+    const later = new Date(Date.now() + 5000);
+    fs.utimesSync(path.join(root, 'sub/c.txt'), later, later);
+    const res = hook.handleHookInput(bash('PostToolUse'), root);
+
+    expect(res.result).toBe('shell');
+    expect(entries().map((e) => path.basename(e.path)).sort()).toEqual(['a.txt', 'b.txt', 'd.txt']);
+    expect(original(byName('a.txt')!)).toBe('A original');
+    expect(byName('b.txt')).toMatchObject({ isNew: false });
+    expect(original(byName('b.txt')!)).toBe('B original');
+    expect(byName('d.txt')).toMatchObject({ isNew: true, snapshot: null });
+  });
+
+  it('keeps the first original of a file already tracked through Edit', () => {
+    hook.recordSnapshot(root, path.join(root, 'a.txt'));
+    write('a.txt', 'A after Edit');
+    hook.handleHookInput(bash('PreToolUse'), root);
+    write('a.txt', 'A after Edit and sed');
+    hook.handleHookInput(bash('PostToolUse'), root);
+    expect(entries()).toHaveLength(1);
+    expect(original(entries()[0])).toBe('A original');
+  });
+
+  it('does not attribute edits made between commands (e.g. by the user) to Claude', () => {
+    hook.handleHookInput(bash('PreToolUse'), root);
+    hook.handleHookInput(bash('PostToolUse'), root);
+    write('a.txt', 'edited by the user in VS Code');
+    hook.handleHookInput(bash('PreToolUse'), root);
+    hook.handleHookInput(bash('PostToolUse'), root);
+    expect(entries()).toEqual([]);
+  });
+
+  it('settles a command whose PostToolUse never came, at Stop', () => {
+    hook.handleHookInput(bash('PreToolUse'), root);
+    write('a.txt', 'changed by a failing command');
+    hook.handleHookInput({ hook_event_name: 'Stop', cwd: root }, root);
+    expect(original(byName('a.txt')!)).toBe('A original');
+    // Nothing in flight any more: a later Stop is a no-op.
+    write('b.txt', 'user edit');
+    hook.handleHookInput({ hook_event_name: 'Stop', cwd: root }, root);
+    expect(byName('b.txt')).toBeUndefined();
+  });
+
+  it('settles a command whose PostToolUse never came, at the next command', () => {
+    hook.handleHookInput(bash('PreToolUse'), root);
+    write('a.txt', 'changed by a failing command');
+    hook.handleHookInput(bash('PreToolUse'), root);
+    expect(original(byName('a.txt')!)).toBe('A original');
+  });
+
+  it('does nothing when PostToolUse arrives without a PreToolUse (hook installed mid-command)', () => {
+    write('a.txt', 'changed');
+    expect(hook.handleHookInput(bash('PostToolUse'), root)).toMatchObject({ result: 'shell', entries: [] });
+    expect(entries()).toEqual([]);
+  });
+
+  it('handles PowerShell like Bash', () => {
+    hook.handleHookInput({ ...bash('PreToolUse'), tool_name: 'PowerShell' }, root);
+    write('a.txt', 'changed by pwsh');
+    hook.handleHookInput({ ...bash('PostToolUse'), tool_name: 'PowerShell' }, root);
+    expect(byName('a.txt')).toBeDefined();
+  });
+
+  it('deduplicates cache blobs and garbage-collects old ones', () => {
+    write('copy.txt', 'A original'); // same content as a.txt
+    hook.handleHookInput(bash('PreToolUse'), root);
+    const blobs = () => fs.readdirSync(hook.cachePaths(root).blobs);
+    expect(blobs().length).toBe(3); // a.txt and copy.txt share one blob; b, c; node_modules excluded
+    write('sub/c.txt', 'C v2');
+    hook.handleHookInput(bash('PostToolUse'), root);
+    expect(original(byName('c.txt')!)).toBe('C original');
+    // The old C blob is copied into originals/, then dropped from the cache on the next sync.
+    hook.handleHookInput(bash('PreToolUse'), root);
+    expect(blobs().length).toBe(3);
+  });
+
+  it('respects .gitignore in a git work tree', () => {
+    const git = spawnSync('git', ['init', '-q'], { cwd: root });
+    if (git.status !== 0) return; // git not available
+    write('.gitignore', 'secret.env\n');
+    write('secret.env', 'TOKEN=1');
+    hook.handleHookInput(bash('PreToolUse'), root);
+    write('secret.env', 'TOKEN=2');
+    write('a.txt', 'A changed');
+    write('untracked-new.txt', 'new');
+    hook.handleHookInput(bash('PostToolUse'), root);
+    expect(entries().map((e) => path.basename(e.path)).sort()).toEqual(['a.txt', 'untracked-new.txt']);
+  });
+
+  it('works end to end through the hook process', () => {
+    const script = installScript();
+    const run = (event: string) =>
+      spawnSync(process.execPath, [script], { input: JSON.stringify(bash(event)), encoding: 'utf8' });
+    expect(run('PreToolUse').status).toBe(0);
+    write('a.txt', 'A via bash');
+    expect(run('PostToolUse').status).toBe(0);
+    expect(original(byName('a.txt')!)).toBe('A original');
+  });
+});

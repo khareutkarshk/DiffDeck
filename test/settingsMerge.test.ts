@@ -5,11 +5,13 @@ import {
   GITIGNORE_ENTRY,
   HOOK_MATCHER,
   isHookInstalled,
+  ourGroups,
   ourHandler,
   parseSettings,
   removeGitignoreEntry,
   removeHook,
   serializeSettings,
+  SHELL_MATCHER,
 } from '../src/core/settingsMerge';
 
 const otherGroup = {
@@ -42,21 +44,26 @@ describe('parseSettings', () => {
 });
 
 describe('addHook', () => {
-  it('adds our group to empty settings', () => {
+  it('adds our PreToolUse, PostToolUse and Stop groups to empty settings', () => {
     const { settings, changed } = addHook({});
     expect(changed).toBe(true);
-    expect(settings).toEqual({ hooks: { PreToolUse: [{ matcher: HOOK_MATCHER, hooks: [ourHandler()] }] } });
+    expect(settings).toEqual({
+      hooks: {
+        PreToolUse: [{ matcher: HOOK_MATCHER, hooks: [ourHandler()] }],
+        PostToolUse: [{ matcher: SHELL_MATCHER, hooks: [ourHandler()] }],
+        Stop: [{ hooks: [ourHandler()] }],
+      },
+    });
+    expect(HOOK_MATCHER).toBe('Edit|Write|MultiEdit|NotebookEdit|Bash|PowerShell');
     expect(isHookInstalled(settings)).toBe(true);
   });
 
-  it('preserves unrelated settings, other events and other PreToolUse groups', () => {
+  it('preserves unrelated settings, other events and other groups (appending ours)', () => {
+    const post = { matcher: 'Edit', hooks: [{ type: 'command', command: 'prettier' }] };
     const input = {
       permissions: { allow: ['Bash(npm test)'] },
       env: { FOO: '1' },
-      hooks: {
-        PostToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: 'prettier' }] }],
-        PreToolUse: [otherGroup],
-      },
+      hooks: { PostToolUse: [post], PreToolUse: [otherGroup], Notification: [{ hooks: [{ type: 'command', command: 'beep' }] }] },
     };
     const snapshot = structuredClone(input);
     const { settings } = addHook(input);
@@ -64,16 +71,21 @@ describe('addHook', () => {
     expect(settings.permissions).toEqual(input.permissions);
     expect(settings.env).toEqual(input.env);
     const hooks = settings.hooks as Record<string, unknown[]>;
-    expect(hooks.PostToolUse).toEqual(input.hooks.PostToolUse);
-    expect(hooks.PreToolUse).toHaveLength(2);
-    expect(hooks.PreToolUse[0]).toEqual(otherGroup);
+    expect(hooks.PreToolUse).toEqual([otherGroup, ourGroups().PreToolUse]);
+    expect(hooks.PostToolUse).toEqual([post, ourGroups().PostToolUse]);
+    expect(hooks.Stop).toEqual([ourGroups().Stop]);
+    expect(hooks.Notification).toEqual(input.hooks.Notification);
   });
 
   it('does not add a duplicate when already installed', () => {
     const once = addHook({}).settings;
     const twice = addHook(once);
     expect(twice.changed).toBe(false);
-    expect((twice.settings.hooks as Record<string, unknown[]>).PreToolUse).toHaveLength(1);
+    expect(twice.settings).toBe(once);
+    const hooks = twice.settings.hooks as Record<string, unknown[]>;
+    expect(hooks.PreToolUse).toHaveLength(1);
+    expect(hooks.PostToolUse).toHaveLength(1);
+    expect(hooks.Stop).toHaveLength(1);
   });
 
   it('installs a shell-form command that quotes the project dir', () => {
@@ -81,21 +93,14 @@ describe('addHook', () => {
     expect(ourHandler().args).toBeUndefined();
   });
 
-  it('updates an older handler of ours in place instead of adding another', () => {
+  it('migrates an older install (exec form, file tools only) without duplicating', () => {
     const legacy = {
       hooks: {
         PreToolUse: [
           otherGroup,
           {
-            matcher: 'Edit|Write',
-            hooks: [
-              {
-                type: 'command',
-                command: 'node',
-                args: ['${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-changes-snapshot.js'],
-                statusMessage: 'custom',
-              },
-            ],
+            matcher: 'Edit|Write|MultiEdit|NotebookEdit',
+            hooks: [{ type: 'command', command: 'node', args: ['${CLAUDE_PROJECT_DIR}/.claude/hooks/claude-changes-snapshot.js'] }],
           },
         ],
       },
@@ -103,19 +108,33 @@ describe('addHook', () => {
     expect(isHookInstalled(legacy)).toBe(true);
     const { settings, changed } = addHook(legacy);
     expect(changed).toBe(true);
-    const groups = (settings.hooks as Record<string, { matcher: string; hooks: unknown[] }[]>).PreToolUse;
-    expect(groups).toHaveLength(2);
-    expect(groups[0]).toEqual(otherGroup);
-    expect(groups[1].matcher).toBe('Edit|Write');
-    expect(groups[1].hooks).toEqual([{ ...ourHandler(), statusMessage: 'custom' }]);
-    // Up to date now: a second install is a no-op.
+    const hooks = settings.hooks as Record<string, unknown[]>;
+    expect(hooks.PreToolUse).toEqual([otherGroup, ourGroups().PreToolUse]);
+    expect(hooks.PostToolUse).toEqual([ourGroups().PostToolUse]);
+    expect(hooks.Stop).toEqual([ourGroups().Stop]);
     expect(addHook(settings).changed).toBe(false);
+  });
+
+  it('pulls our handler out of a shared group but keeps the other handler there', () => {
+    const shared = {
+      hooks: { PreToolUse: [{ matcher: 'Edit', hooks: [{ type: 'command', command: 'lint.sh' }, ourHandler()] }] },
+    };
+    const hooks = addHook(shared).settings.hooks as Record<string, unknown[]>;
+    expect(hooks.PreToolUse).toEqual([
+      { matcher: 'Edit', hooks: [{ type: 'command', command: 'lint.sh' }] },
+      ourGroups().PreToolUse,
+    ]);
+  });
+
+  it('refuses a settings file whose hook events are not arrays', () => {
+    expect(parseSettings('{"hooks": {"Stop": {}}}')).toMatchObject({ ok: false });
   });
 
   it('round-trips through serialize/parse', () => {
     const text = serializeSettings(addHook({ model: 'opus' }).settings, 2);
     const parsed = parseSettings(text);
     expect(parsed.ok && isHookInstalled(parsed.settings)).toBe(true);
+    expect(parsed.ok && addHook(parsed.settings).changed).toBe(false);
     expect(text.endsWith('\n')).toBe(true);
   });
 });

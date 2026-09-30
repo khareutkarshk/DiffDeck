@@ -37,6 +37,19 @@ function claudeWrites(root, rel, content, tool = 'Edit') {
   fs.writeFileSync(file, content);
 }
 
+/** What Claude Code does for a Bash command: PreToolUse hook, the command, PostToolUse hook. */
+function claudeRunsBash(root, command) {
+  const script = path.join(root, '.claude/hooks/claude-changes-snapshot.js');
+  const hookRun = (event) => {
+    const input = JSON.stringify({ cwd: root, hook_event_name: event, tool_name: 'Bash', tool_input: { command: 'x' } });
+    const res = cp.spawnSync(process.env.NODE_BIN || 'node', [script], { input, encoding: 'utf8' });
+    assert.strictEqual(res.status, 0, `hook exited ${res.status}: ${res.stderr}`);
+  };
+  hookRun('PreToolUse');
+  command();
+  hookRun('PostToolUse');
+}
+
 const results = [];
 async function step(name, fn) {
   try {
@@ -228,6 +241,28 @@ async function run() {
       assert.deepStrictEqual([...fs.readFileSync(path.join(root, 'img.bin'))], [0, 1, 2, 3]);
     });
 
+    await step('changes made through Bash are tracked (modify, create, delete)', async () => {
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      claudeRunsBash(root, () => {
+        assert.strictEqual(fs.readFileSync(fileA.fsPath, 'utf8'), 'kept\n');
+        fs.writeFileSync(fileA.fsPath, 'KEPT (sed)\nappended\n');
+        fs.writeFileSync(path.join(root, 'generated.txt'), 'made by a script\n');
+        fs.rmSync(fileCrlf.fsPath);
+      });
+      const files = await waitFor('3 bash changes', async () => {
+        const f = await service.changedFiles();
+        return f.length === 3 ? f : undefined;
+      });
+      const byRel = Object.fromEntries(files.map((f) => [f.file.relPath, f]));
+      assert.deepStrictEqual(byRel['src/a.txt'].hunks.map((h) => [h.baseLines, h.curLines]), [[['kept'], ['KEPT (sed)', 'appended']]]);
+      assert.strictEqual(byRel['generated.txt'].status, 'new');
+      assert.strictEqual(byRel['crlf.txt'].status, 'deleted');
+      const failed = await service.undoAll();
+      assert.deepStrictEqual(failed, []);
+      assert.strictEqual(fs.readFileSync(fileCrlf.fsPath, 'utf8'), 'alpha\r\nBETA\r\ngamma\r\n', 'deleted file restored');
+      assert.ok(!fs.existsSync(path.join(root, 'generated.txt')));
+    });
+
     await step('uninstall removes only our hook', async () => {
       const done = vscode.commands.executeCommand('claudeChanges.uninstallHook');
       // The "delete review data?" prompt is non-modal; don't wait for it.
@@ -235,6 +270,8 @@ async function run() {
       const settings = JSON.parse(fs.readFileSync(path.join(root, '.claude/settings.json'), 'utf8'));
       assert.strictEqual(settings.hooks.PreToolUse.length, 1);
       assert.strictEqual(settings.hooks.PreToolUse[0].matcher, 'Bash');
+      assert.strictEqual(settings.hooks.PostToolUse, undefined);
+      assert.strictEqual(settings.hooks.Stop, undefined);
       assert.ok(!fs.existsSync(path.join(root, '.claude/hooks/claude-changes-snapshot.js')));
       assert.doesNotMatch(fs.readFileSync(path.join(root, '.gitignore'), 'utf8'), /claude\/review/);
     });
