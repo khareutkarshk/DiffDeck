@@ -1,0 +1,8 @@
+**
+!dist/extension.js
+!hook/snapshot.js
+!media/**
+!package.json
+!README.md
+!CHANGELOG.md
+!LICENSE
