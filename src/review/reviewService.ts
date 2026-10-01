@@ -266,7 +266,17 @@ export class ReviewService implements vscode.Disposable {
   /** Baseline text for the claude-original: provider. */
   baselineText(uri: vscode.Uri): string {
     const f = this.tracked(uri);
-    if (!f) return '';
+    if (!f) {
+      // Not (or no longer) under review: the "original" is the current text, so a review tab that is
+      // still open shows no changes instead of the whole file as added.
+      const doc = openDocument(uri);
+      if (doc) return doc.getText();
+      try {
+        return decoder.decode(fs.readFileSync(uri.fsPath));
+      } catch {
+        return '';
+      }
+    }
     const bytes = f.root.readSnapshot(f.entry);
     if (!bytes) return '';
     const kind = classifyContent(bytes);

@@ -102,6 +102,66 @@ export function computeHunks(baseText: string, curText: string): Hunk[] {
     }
   }
   if (open) hunks.push(open);
+  return shiftToBetterBoundaries(hunks, base, cur);
+}
+
+function indentation(token: string | undefined): number {
+  if (token === undefined) return 0;
+  let i = 0;
+  while (i < token.length && (token[i] === ' ' || token[i] === '\t')) i++;
+  return i;
+}
+
+/** Same scoring as VS Code's diff editor: splits between less-indented lines are better. */
+function boundaryScore(tokens: readonly string[], at: number): number {
+  const before = at === 0 ? 0 : indentation(tokens[at - 1]);
+  const after = at === tokens.length ? 0 : indentation(tokens[at]);
+  return 1000 - (before + after);
+}
+
+/**
+ * A pure insertion/deletion can often be placed in several equally valid spots (e.g. which of two
+ * identical "</div>" lines was removed). Pick the spot VS Code's diff editor picks, so our hunks line
+ * up with the red/green rows it draws in the stacked review.
+ */
+function shiftToBetterBoundaries(hunks: Hunk[], base: readonly string[], cur: readonly string[]): Hunk[] {
+  for (let k = 0; k < hunks.length; k++) {
+    const h = hunks[k];
+    const deletion = h.curLines.length === 0 && h.baseLines.length > 0;
+    const insertion = h.baseLines.length === 0 && h.curLines.length > 0;
+    if (!deletion && !insertion) continue;
+    const [blockSeq, blockStart, len] = deletion ? [base, h.baseStart, h.baseLines.length] : [cur, h.curStart, h.curLines.length];
+    // Room to move without touching the neighbouring hunks.
+    const prev = hunks[k - 1];
+    const next = hunks[k + 1];
+    const minStart = prev ? (deletion ? prev.baseStart + prev.baseLines.length : prev.curStart + prev.curLines.length) : 0;
+    const maxEnd = next ? (deletion ? next.baseStart : next.curStart) : blockSeq.length;
+    let up = 0;
+    while (blockStart - up - 1 >= minStart && blockSeq[blockStart - up - 1] === blockSeq[blockStart + len - up - 1]) up++;
+    let down = 0;
+    while (blockStart + len + down < maxEnd && blockSeq[blockStart + down] === blockSeq[blockStart + len + down]) down++;
+    if (!up && !down) continue;
+
+    const other = deletion ? cur : base;
+    const otherPoint = deletion ? h.curStart : h.baseStart;
+    let best = 0;
+    let bestScore = -Infinity;
+    for (let d = -up; d <= down; d++) {
+      const score =
+        boundaryScore(blockSeq, blockStart + d) +
+        boundaryScore(blockSeq, blockStart + len + d) +
+        2 * boundaryScore(other, otherPoint + d);
+      if (score > bestScore) {
+        bestScore = score;
+        best = d;
+      }
+    }
+    if (best === 0) continue;
+    const lines = blockSeq.slice(blockStart + best, blockStart + best + len).map(stripNl);
+    hunks[k] = deletion
+      ? { curStart: h.curStart + best, curLines: [], baseStart: h.baseStart + best, baseLines: lines }
+      : { curStart: h.curStart + best, curLines: lines, baseStart: h.baseStart + best, baseLines: [] };
+  }
   return hunks;
 }
 

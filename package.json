@@ -2,7 +2,7 @@
   "name": "claude-changes",
   "displayName": "Claude Changes",
   "description": "Cursor-style review panel for files edited by Claude Code: inline red/green diffs with Keep/Undo per hunk, per file, and for everything.",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "publisher": "local",
   "license": "MIT",
   "repository": {
@@ -41,23 +41,12 @@
     "views": {
       "claudeChanges": [
         {
+          "type": "webview",
           "id": "claudeChanges.files",
           "name": "Claude Changes"
         }
       ]
     },
-    "viewsWelcome": [
-      {
-        "view": "claudeChanges.files",
-        "contents": "No pending changes from Claude.\n\nFiles that Claude Code edits or creates will show up here for review.",
-        "when": "claudeChanges.hookInstalled"
-      },
-      {
-        "view": "claudeChanges.files",
-        "contents": "The Claude Changes hook is not installed in this workspace yet.\n[Install Hook](command:claudeChanges.installHook)",
-        "when": "!claudeChanges.hookInstalled"
-      }
-    ],
     "commands": [
       {
         "command": "claudeChanges.installHook",
@@ -115,13 +104,13 @@
         "command": "claudeChanges.nextFile",
         "title": "Next File",
         "category": "Claude Changes",
-        "icon": "$(arrow-down)"
+        "icon": "$(chevron-right)"
       },
       {
         "command": "claudeChanges.prevFile",
         "title": "Previous File",
         "category": "Claude Changes",
-        "icon": "$(arrow-up)"
+        "icon": "$(chevron-left)"
       },
       {
         "command": "claudeChanges.nextHunk",
@@ -135,12 +124,12 @@
       },
       {
         "command": "claudeChanges.keepHunk",
-        "title": "Keep Hunk",
+        "title": "Keep Change at Cursor",
         "category": "Claude Changes"
       },
       {
         "command": "claudeChanges.undoHunk",
-        "title": "Undo Hunk",
+        "title": "Undo Change at Cursor",
         "category": "Claude Changes"
       },
       {
@@ -152,16 +141,28 @@
         "command": "claudeChanges.focusPanel",
         "title": "Focus Panel",
         "category": "Claude Changes"
+      },
+      {
+        "command": "claudeChanges.review",
+        "title": "Review Changes",
+        "category": "Claude Changes",
+        "icon": "$(eye)"
+      },
+      {
+        "command": "claudeChanges.gotoHunk",
+        "title": "Go to Change",
+        "category": "Claude Changes"
+      },
+      {
+        "command": "claudeChanges.useStackedView",
+        "title": "Use Stacked (Inline) Review View",
+        "category": "Claude Changes"
       }
     ],
     "menus": {
       "commandPalette": [
         {
-          "command": "claudeChanges.keepHunk",
-          "when": "false"
-        },
-        {
-          "command": "claudeChanges.undoHunk",
+          "command": "claudeChanges.gotoHunk",
           "when": "false"
         },
         {
@@ -171,19 +172,9 @@
       ],
       "view/title": [
         {
-          "command": "claudeChanges.keepAll",
-          "when": "view == claudeChanges.files && claudeChanges.hasChanges",
-          "group": "navigation@1"
-        },
-        {
-          "command": "claudeChanges.undoAll",
-          "when": "view == claudeChanges.files && claudeChanges.hasChanges",
-          "group": "navigation@2"
-        },
-        {
           "command": "claudeChanges.refresh",
           "when": "view == claudeChanges.files",
-          "group": "navigation@3"
+          "group": "navigation@1"
         },
         {
           "command": "claudeChanges.installHook",
@@ -194,47 +185,83 @@
           "command": "claudeChanges.uninstallHook",
           "when": "view == claudeChanges.files",
           "group": "setup@2"
+        },
+        {
+          "command": "claudeChanges.useStackedView",
+          "when": "view == claudeChanges.files",
+          "group": "setup@3"
         }
       ],
-      "view/item/context": [
+      "webview/context": [
         {
           "command": "claudeChanges.openDiff",
-          "when": "view == claudeChanges.files && viewItem =~ /^claudeFile/",
-          "group": "inline@1"
-        },
-        {
-          "command": "claudeChanges.undoFile",
-          "when": "view == claudeChanges.files && viewItem =~ /^claudeFile/",
-          "group": "inline@2"
-        },
-        {
-          "command": "claudeChanges.keepFile",
-          "when": "view == claudeChanges.files && viewItem =~ /^claudeFile/",
-          "group": "inline@3"
-        },
-        {
-          "command": "claudeChanges.keepFile",
-          "when": "view == claudeChanges.files && viewItem =~ /^claudeFile/",
-          "group": "1_review@1"
-        },
-        {
-          "command": "claudeChanges.undoFile",
-          "when": "view == claudeChanges.files && viewItem =~ /^claudeFile/",
-          "group": "1_review@2"
+          "when": "webviewId == 'claudeChanges.files' && webviewSection == 'file'",
+          "group": "1_open@1"
         },
         {
           "command": "claudeChanges.openFile",
-          "when": "view == claudeChanges.files && viewItem =~ /^claudeFile/",
-          "group": "2_open@1"
+          "when": "webviewId == 'claudeChanges.files' && webviewSection == 'file'",
+          "group": "1_open@2"
         },
         {
-          "command": "claudeChanges.openDiff",
-          "when": "view == claudeChanges.files && viewItem =~ /^claudeFile/",
-          "group": "2_open@2"
+          "command": "claudeChanges.keepFile",
+          "when": "webviewId == 'claudeChanges.files' && webviewSection == 'file'",
+          "group": "2_review@1"
+        },
+        {
+          "command": "claudeChanges.undoFile",
+          "when": "webviewId == 'claudeChanges.files' && webviewSection == 'file'",
+          "group": "2_review@2"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "claudeChanges.prevFile",
+          "when": "claudeChanges.activeEditorTracked && claudeChanges.multipleFiles",
+          "group": "navigation@-40"
+        },
+        {
+          "command": "claudeChanges.nextFile",
+          "when": "claudeChanges.activeEditorTracked && claudeChanges.multipleFiles",
+          "group": "navigation@-39"
+        },
+        {
+          "command": "claudeChanges.undoFile",
+          "when": "claudeChanges.activeEditorTracked",
+          "group": "navigation@-38"
+        },
+        {
+          "command": "claudeChanges.keepFile",
+          "when": "claudeChanges.activeEditorTracked",
+          "group": "navigation@-37"
         }
       ]
     },
     "keybindings": [
+      {
+        "command": "claudeChanges.keepHunk",
+        "key": "ctrl+alt+y",
+        "mac": "cmd+alt+y",
+        "when": "editorTextFocus && claudeChanges.activeEditorTracked"
+      },
+      {
+        "command": "claudeChanges.undoHunk",
+        "key": "ctrl+alt+n",
+        "mac": "cmd+alt+n",
+        "when": "editorTextFocus && claudeChanges.activeEditorTracked"
+      },
+      {
+        "command": "claudeChanges.keepFile",
+        "key": "ctrl+shift+alt+y",
+        "mac": "cmd+shift+alt+y",
+        "when": "claudeChanges.activeEditorTracked"
+      },
+      {
+        "command": "claudeChanges.undoFile",
+        "key": "ctrl+shift+alt+n",
+        "mac": "cmd+shift+alt+n",
+        "when": "claudeChanges.activeEditorTracked"
+      },
       {
         "command": "claudeChanges.nextHunk",
         "key": "alt+f5",
@@ -262,15 +289,17 @@
         "claudeChanges.viewMode": {
           "type": "string",
           "enum": [
+            "inlineDiff",
             "decorations",
             "inlineDiffEditor"
           ],
           "enumDescriptions": [
-            "Open the real, editable file with red/green inline decorations and per-hunk Keep/Undo (Cursor-style).",
-            "Open VS Code's built-in diff editor in inline (unified) mode."
+            "Stacked review (like Cursor): VS Code's inline diff editor with removed lines in red above added lines in green, editable, with Keep / Undo per change and per file.",
+            "Open the real file with green line highlights and red markers/ghost text where lines were removed.",
+            "Old name of \"inlineDiff\"."
           ],
-          "default": "decorations",
-          "description": "How a changed file is shown when opened from the Claude Changes panel."
+          "default": "inlineDiff",
+          "description": "How a changed file is shown when opened for review."
         },
         "claudeChanges.showDecorationsAutomatically": {
           "type": "boolean",

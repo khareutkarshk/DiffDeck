@@ -69,7 +69,14 @@ async function run() {
   const service = api.service;
   const cfg = vscode.workspace.getConfiguration('claudeChanges');
   await cfg.update('confirmUndo', false, vscode.ConfigurationTarget.Workspace);
-  await vscode.workspace.getConfiguration('diffEditor').update('renderSideBySide', false, vscode.ConfigurationTarget.Workspace);
+  await cfg.update('viewMode', 'decorations', vscode.ConfigurationTarget.Workspace);
+  // What the one-time "Use Stacked View" prompt sets (so it doesn't block the test).
+  const diffCfg = vscode.workspace.getConfiguration('diffEditor');
+  await diffCfg.update('renderSideBySide', false, vscode.ConfigurationTarget.Global);
+  await diffCfg.update('codeLens', true, vscode.ConfigurationTarget.Global);
+  if (diffCfg.inspect('hideOriginalLineNumbers')?.defaultValue !== undefined) {
+    await diffCfg.update('hideOriginalLineNumbers', true, vscode.ConfigurationTarget.Global);
+  }
 
   const fileA = vscode.Uri.file(path.join(root, 'src/a.txt'));
   const fileCrlf = vscode.Uri.file(path.join(root, 'crlf.txt'));
@@ -118,9 +125,11 @@ async function run() {
       const titles = lenses.map((l) => l.command && l.command.title);
       assert.ok(titles.includes('$(check) Keep File'));
       assert.ok(titles.includes('$(discard) Undo File'));
-      assert.ok(titles.some((t) => /^Next ▶ \(\d\/3 files\)$/.test(t)), `titles: ${titles}`);
-      assert.strictEqual(titles.filter((t) => t === '$(check) Keep').length, 3);
-      assert.strictEqual(titles.filter((t) => /^▾ Show 1 removed$/.test(t)).length, 2);
+      assert.ok(titles.some((t) => /^\d of 3 Files$/.test(t)), `titles: ${titles}`);
+      assert.ok(titles.includes('‹') && titles.includes('›'));
+      assert.strictEqual(titles.filter((t) => /^\$\(check\) Keep (Ctrl\+Alt|⌥⌘)\+?Y$/.test(t)).length, 3, `titles: ${titles}`);
+      assert.deepStrictEqual(titles.filter((t) => / of 3$/.test(t)), ['1 of 3', '2 of 3', '3 of 3']);
+      assert.strictEqual(titles.filter((t) => /^▾ 1 removed$/.test(t)).length, 2);
     });
 
     await step('undo a hunk via WorkspaceEdit, and Ctrl+Z brings it back', async () => {
@@ -172,15 +181,82 @@ async function run() {
       assert.strictEqual(vscode.window.activeTextEditor.document.uri.fsPath, fileA.fsPath);
     });
 
-    await step('inline diff editor mode opens a diff against claude-original:', async () => {
+    await step('stacked view: opens an inline diff against claude-original: with review CodeLenses', async () => {
+      await cfg.update('viewMode', 'inlineDiff', vscode.ConfigurationTarget.Workspace);
+      fs.writeFileSync(path.join(root, 'src/stacked.txt'), 'a\nb\nc\nd\ne\nf\n');
+      claudeWrites(root, 'src/stacked.txt', 'A\nb\nc\nD\ne\nF\n');
+      const fileS = vscode.Uri.file(path.join(root, 'src/stacked.txt'));
+      await waitFor('stacked tracked', async () => (await service.state(fileS))?.hunks.length === 3);
+      await vscode.commands.executeCommand('claudeChanges.openDiff', fileS);
+      const tab = await waitFor('diff tab', async () => {
+        const t = vscode.window.tabGroups.activeTabGroup.activeTab;
+        return t && t.input instanceof vscode.TabInputTextDiff ? t : undefined;
+      });
+      assert.strictEqual(tab.input.original.scheme, 'claude-original');
+      assert.strictEqual(tab.input.modified.fsPath, fileS.fsPath);
+      const orig = await vscode.workspace.openTextDocument(tab.input.original);
+      assert.strictEqual(orig.getText(), 'a\nb\nc\nd\ne\nf\n');
+      const editor = vscode.window.activeTextEditor;
+      assert.strictEqual(editor.document.uri.fsPath, fileS.fsPath, 'modified side is the real, editable file');
+      assert.strictEqual(editor.selection.active.line, 0, 'lands on the first change');
+      const titles = (await vscode.commands.executeCommand('vscode.executeCodeLensProvider', fileS)).map((l) => l.command.title);
+      assert.ok(titles.includes('$(check) Keep File') && titles.some((t) => / of 4 Files$/.test(t)), `titles: ${titles}`);
+      assert.ok(!titles.some((t) => /removed$/.test(t)), 'no peek lens in the stacked view (removed lines are visible)');
+    });
+
+    await step('stacked view: hover over a block shows "n of N" with Undo / Keep', async () => {
+      const fileS = vscode.Uri.file(path.join(root, 'src/stacked.txt'));
+      const hovers = await vscode.commands.executeCommand('vscode.executeHoverProvider', fileS, new vscode.Position(3, 0));
+      const text = hovers.flatMap((h) => h.contents.map((c) => (typeof c === 'string' ? c : c.value))).join('\n');
+      assert.match(text, /\*\*2 of 3\*\*/);
+      assert.match(text, /claudeChanges\.undoHunk/);
+      assert.match(text, /claudeChanges\.keepHunk/);
+      const none = await vscode.commands.executeCommand('vscode.executeHoverProvider', fileS, new vscode.Position(1, 0));
+      assert.ok(!none.some((h) => h.contents.some((c) => /of 3\*\*/.test(typeof c === 'string' ? c : c.value))), 'no hover on unchanged lines');
+    });
+
+    await step('stacked view: keybinding commands act on the change at the cursor', async () => {
+      const fileS = vscode.Uri.file(path.join(root, 'src/stacked.txt'));
+      const editor = vscode.window.activeTextEditor;
+      editor.selection = new vscode.Selection(3, 0, 3, 0); // on "D"
+      await vscode.commands.executeCommand('claudeChanges.undoHunk');
+      assert.strictEqual(editor.document.getText(), 'A\nb\nc\nd\ne\nF\n');
+      editor.selection = new vscode.Selection(0, 0, 0, 0); // on "A"
+      await vscode.commands.executeCommand('claudeChanges.keepHunk');
+      const st = await waitFor('1 hunk left', async () => {
+        const s = await service.state(fileS);
+        return s.hunks.length === 1 ? s : undefined;
+      });
+      assert.deepStrictEqual(st.hunks[0].curLines, ['F']);
+      await waitFor('original side updated', async () => {
+        const o = vscode.workspace.textDocuments.find((d) => d.uri.scheme === 'claude-original' && d.uri.path === fileS.path);
+        return o && o.getText().startsWith('A\n');
+      });
+    });
+
+    await step('stacked view: Keep File turns the review tab back into a normal editor', async () => {
+      const fileS = vscode.Uri.file(path.join(root, 'src/stacked.txt'));
+      await vscode.commands.executeCommand('claudeChanges.keepFile', fileS);
+      await waitFor('plain editor', async () => {
+        const t = vscode.window.tabGroups.activeTabGroup.activeTab;
+        return t && t.input instanceof vscode.TabInputText && t.input.uri.fsPath === fileS.fsPath;
+      });
+      assert.ok(
+        !vscode.window.tabGroups.all.some((g) => g.tabs.some((t) => t.input instanceof vscode.TabInputTextDiff)),
+        'no review diff tab left',
+      );
+      await vscode.workspace.saveAll();
+      await cfg.update('viewMode', 'decorations', vscode.ConfigurationTarget.Workspace);
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+    });
+
+    await step('stacked view: the old "inlineDiffEditor" setting value still means the stacked view', async () => {
       await cfg.update('viewMode', 'inlineDiffEditor', vscode.ConfigurationTarget.Workspace);
       await vscode.commands.executeCommand('claudeChanges.openDiff', fileCrlf);
       const tab = await waitFor('diff tab', async () => {
         const t = vscode.window.tabGroups.activeTabGroup.activeTab;
         return t && t.input instanceof vscode.TabInputTextDiff ? t : undefined;
       });
-      assert.strictEqual(tab.input.original.scheme, 'claude-original');
-      assert.strictEqual(tab.input.modified.fsPath, fileCrlf.fsPath);
       const orig = await vscode.workspace.openTextDocument(tab.input.original);
       assert.strictEqual(orig.getText().replace(/\r\n/g, '\n'), 'alpha\nbeta\ngamma\n');
       await cfg.update('viewMode', 'decorations', vscode.ConfigurationTarget.Workspace);

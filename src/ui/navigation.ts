@@ -1,8 +1,8 @@
 import * as vscode from 'vscode';
-import { findHunk } from '../core/hunks';
+import { findHunk, hunkFingerprint } from '../core/hunks';
 import { FileState, ReviewService } from '../review/reviewService';
 import { originalUri } from '../review/originalProvider';
-import { activeFileUri, config, hunkAnchorLine, sameFile, ViewMode } from './common';
+import { activeFileUri, config, hunkAnchorLine, hunkIndexAt, sameFile, ViewMode } from './common';
 import { openInlineDiff } from './diffEditor';
 import { InlineDecorations } from './inlineDecorations';
 
@@ -21,14 +21,53 @@ export class Navigator {
       return;
     }
     if (st.kind !== 'text') return this.showBinaryMessage(st);
-    if (mode === 'inlineDiffEditor' || !st.exists) {
-      await openInlineDiff(this.context, st);
+    this.decorations.enable(uri);
+    let editor: vscode.TextEditor | undefined;
+    if (mode === 'inlineDiff' || !st.exists) {
+      editor = await openInlineDiff(this.context, st);
+    } else {
+      editor = await vscode.window.showTextDocument(uri, { preview: false });
+    }
+    const first = st.hunks[0];
+    // Land on the first change, unless the editor was already open somewhere inside the file.
+    if (editor && first && editor.selection.active.line === 0) {
+      this.revealLine(editor, hunkAnchorLine(first, editor.document.lineCount));
+    }
+  }
+
+  /** "Review": the file in the active editor if it has changes, else the first changed file. */
+  async review(): Promise<void> {
+    const files = await this.service.changedFiles();
+    if (!files.length) {
+      void vscode.window.showInformationMessage('No pending Claude changes.');
       return;
     }
-    this.decorations.enable(uri);
-    const editor = await vscode.window.showTextDocument(uri, { preview: false });
-    const first = st.hunks[0];
-    if (first) this.revealLine(editor, hunkAnchorLine(first, editor.document.lineCount));
+    const current = activeFileUri();
+    const target = files.find((f) => sameFile(f.file.uri, current)) ?? files[0];
+    await this.open(target.file.uri);
+  }
+
+  /** Jump to the i-th change of a file (CodeLens / hover ⌃ ⌄). */
+  async gotoHunk(uriArg: string, index: number): Promise<void> {
+    const uri = vscode.Uri.parse(uriArg);
+    const st = await this.service.state(uri);
+    const h = st?.hunks[index];
+    if (!h) return;
+    const editor =
+      vscode.window.activeTextEditor && sameFile(vscode.window.activeTextEditor.document.uri, uri)
+        ? vscode.window.activeTextEditor
+        : vscode.window.visibleTextEditors.find((e) => sameFile(e.document.uri, uri));
+    if (editor) this.revealLine(editor, hunkAnchorLine(h, editor.document.lineCount));
+  }
+
+  /** The change at the cursor of the active editor (for the Keep/Undo keybindings). */
+  async hunkAtCursor(): Promise<{ uri: vscode.Uri; fingerprint: string } | undefined> {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor || editor.document.uri.scheme !== 'file') return undefined;
+    const st = await this.service.state(editor.document.uri);
+    if (!st?.hunks.length) return undefined;
+    const i = hunkIndexAt(st.hunks, editor.selection.active.line, editor.document.lineCount);
+    return { uri: editor.document.uri, fingerprint: hunkFingerprint(st.hunks[i]) };
   }
 
   /** Plain "Open File": the real file, no forced decorations. */

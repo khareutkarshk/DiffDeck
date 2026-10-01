@@ -95,85 +95,104 @@ If `settings.json` isn't valid JSON, the install stops and changes nothing.
 
 ## Reviewing
 
-- **Panel.** The Claude Changes icon in the Activity Bar lists every pending file with its relative
-  path, a `+added −removed` count, and a **U** (new), **M** (modified) or **D** (deleted) badge.
-  Hover a file for Keep / Undo / Open Diff; the context menu adds Open File. The title bar has
-  **Keep All**, **Undo All** (always asks first) and **Refresh**. The icon's badge and the status
-  bar item (`Claude: N files changed`) show the pending count.
-- **In the file** (decorations mode), CodeLenses stand in for Cursor's floating review bar:
-  - `Keep File | Undo File | ◀ Prev | Next ▶ (2/5 files)` on the first line;
-  - `Keep | Undo | ▾ Show N removed` above each hunk.
-- **Hunk actions.**
-  - **Undo** restores the original lines in place through a `WorkspaceEdit`, so **Ctrl+Z** brings
-    Claude's version back.
-  - **Keep** moves the hunk into the file's baseline, so it stops showing as a change.
-  - Once every hunk has been kept, the file leaves the list. Once every hunk has been undone, it
-    leaves the list immediately and is removed from the manifest when you close the editor, so
-    Ctrl+Z still works until then.
+The review UI follows Cursor and VS Code's chat editing as closely as VS Code's public extension API
+allows.
+
+- **Files panel.** Click the Claude Changes icon in the Activity Bar.
+  - **Header:** `▾ 19 Files` with **Undo All**, **Keep All** and **Review** buttons.
+  - **Rows:** one per changed file, with your icon theme's file icon and a green `+added` / red
+    `-removed` count. Deleted files are struck through.
+  - **Actions:** click a row to review the file. Hover a row for Open File / Undo File / Keep
+    File, or right-click it.
+  - **Badge:** the Activity Bar icon shows the pending count after the panel has been shown once;
+    the status bar item `Claude: N files changed` always shows it.
+- **Stacked review** (the default view):
+  - **Layout:** the file opens in VS Code's inline diff editor. Each removed line is a red row
+    stacked above the green lines that replaced it, in one editor with one column of line numbers.
+  - **Editing:** the right side is the real file, so you can keep editing it while reviewing.
+- **File bar.** The first line shows `‹ 2 of 19 Files › · Undo File · Keep File · +60 −40`. The
+  editor title bar has the same ‹ › Undo File / Keep File buttons. The status bar shows
+  `File 2/19 · Change 4/17` for the cursor position.
+- **Per-change bar.** Every change gets a row `⌃ ⌄ 4 of 17 · Undo Ctrl+Alt+N · Keep Ctrl+Alt+Y`.
+  Hovering the changed lines shows the same controls.
+  - **Undo** restores the original lines through a normal edit, so **Ctrl+Z** brings Claude's
+    version back.
+  - **Keep** moves the change into the file's baseline, so it stops showing as a change.
+- **When a file is done** (every change kept or undone, or Keep File / Undo File), its review tab
+  turns back into a normal editor at the same position.
 - **File actions.**
-  - **Undo** writes the exact original bytes back, or deletes the file if Claude created it. Open
-    editors update to match.
-  - **Keep** accepts everything and drops the snapshot. If Claude edits the file again later, it
-    gets a fresh snapshot of the kept state.
-- **Your own edits** to a file under review are picked up live, including unsaved ones: hunks,
-  counts and decorations recompute as you type.
+  - **Undo File** writes the exact original bytes back, or deletes the file if Claude created it.
+  - **Keep File** accepts everything. If Claude edits the file again later, it gets a fresh
+    snapshot of the kept state.
+- **Your own edits** to a file under review are picked up live, including unsaved ones.
 
 ## View modes
 
 Set `claudeChanges.viewMode`.
 
-### `decorations` (default, closest to Cursor)
+### `inlineDiff` (default): stacked, like Cursor
 
-Opens the real file in a normal, editable editor.
-
-- **Added or changed lines** get a green whole-line background (`diffEditor.insertedLineBackground`)
-  and a green **+** gutter icon.
-- **Removed lines.** VS Code's API can't insert real virtual lines, so they're shown with:
-  - a red marker line where lines were removed, plus a red **−** gutter icon for pure deletions;
-  - red strikethrough ghost text at the end of that line, showing the first removed line and a count;
-  - a hover with the full removed block as a `diff` code block, with Keep / Undo links;
-  - **`▾ Show N removed`**, which opens the removed lines *inline* in a peek widget. That is the
-    only public API that actually opens vertical space inside the file.
-- All colors follow the theme. You can override them under `workbench.colorCustomizations`:
-  `claudeChanges.addedLineBackground`, `claudeChanges.removedLineBackground`,
-  `claudeChanges.removedGhostText`, `claudeChanges.removedMarker`.
-
-### `inlineDiffEditor`
-
-Opens VS Code's built-in diff editor against a read-only `claude-original:` document. New files diff
+VS Code's diff editor, compared against a read-only `claude-original:` document. New files compare
 against an empty document, and deleted files against an empty "(deleted)" stand-in.
 
-**Trade-off:** VS Code has no API to force inline (unified) mode for a single diff. The only switch
-is the `diffEditor.renderSideBySide` setting. So, if you use side-by-side, the first time you open a
-diff from here the extension asks once whether to set `"diffEditor.renderSideBySide": false` **for
-this workspace only** (`.vscode/settings.json`).
+**One-time settings prompt.** VS Code has no API to make a single diff editor inline: the inline
+view, and CodeLens inside diff editors, are global settings. The first time you open a review, the
+extension asks once whether to set these in your **User settings**:
 
-- It never changes your User settings.
-- If you accept, Git diffs in that workspace become inline too. To undo it, delete that line from
-  `.vscode/settings.json`.
+| Setting | Value | Why |
+| --- | --- | --- |
+| `diffEditor.renderSideBySide` | `false` | stacked red/green rows instead of two panes |
+| `diffEditor.codeLens` | `true` | the `Keep / Undo` rows inside the diff editor |
+| `diffEditor.hideOriginalLineNumbers` | `true` | one line-number column (newer VS Code only) |
 
-Hunk CodeLenses work in the diff editor's editable side as well.
+Git and other diff editors then use the same view. If you choose **Keep Current View**, reviews
+open side by side, and the hover still gives you Undo / Keep. Run **Claude Changes: Use Stacked
+(Inline) Review View** to be asked again.
 
-## Commands
+### `decorations`
 
-| Command | Default key |
+Opens the plain file with no diff editor.
+
+- **Added or changed lines** get a green background and a **+** gutter icon.
+- **Removed lines** get a red marker line, red strikethrough ghost text, and a `▾ N removed`
+  CodeLens that shows them in a peek.
+- **Toolbar:** the same file bar, per-change bar and hover as the stacked view.
+
+## Commands and keys
+
+| Command | Default key (macOS) |
 | --- | --- |
-| Claude Changes: Install Hook in Workspace / Uninstall Hook | |
-| Claude Changes: Next File / Previous File (opens in the current view mode) | `Alt+F6` / `Shift+Alt+F6` |
-| Claude Changes: Next Hunk / Previous Hunk | `Alt+F5` / `Shift+Alt+F5` |
-| Claude Changes: Keep File / Undo File / Open File / Open Diff | |
-| Claude Changes: Keep All / Undo All / Refresh / Focus Panel | |
+| Keep / Undo change at cursor | `Ctrl+Alt+Y` / `Ctrl+Alt+N` (`⌥⌘Y` / `⌥⌘N`) |
+| Keep / Undo file | `Ctrl+Shift+Alt+Y` / `Ctrl+Shift+Alt+N` |
+| Next / Previous change | `Alt+F5` / `Shift+Alt+F5` |
+| Next / Previous file | `Alt+F6` / `Shift+Alt+F6` |
+| Review Changes · Keep All · Undo All · Refresh · Focus Panel | |
+| Install Hook in Workspace · Uninstall Hook · Use Stacked (Inline) Review View | |
 
-You can rebind any of them in *Keyboard Shortcuts* (search for "Claude Changes").
+The change and file keys only apply while a file with pending changes is focused, so Redo
+(`Ctrl+Y`) and New File (`Ctrl+N`) are never taken over. Rebind any of them in *Keyboard
+Shortcuts* (search for "Claude Changes").
 
 ## Settings
 
 | Setting | Default | |
 | --- | --- | --- |
-| `claudeChanges.viewMode` | `"decorations"` | `"decorations"` or `"inlineDiffEditor"` |
-| `claudeChanges.showDecorationsAutomatically` | `true` | Decorate any tracked file you open, not only ones opened from the panel |
+| `claudeChanges.viewMode` | `"inlineDiff"` | `"inlineDiff"` (stacked) or `"decorations"` |
+| `claudeChanges.showDecorationsAutomatically` | `true` | Show review controls in any tracked file you open, not only ones opened from the panel |
 | `claudeChanges.confirmUndo` | `true` | Confirm before undoing a whole file (Undo All always confirms) |
-| `claudeChanges.autoOpenPanel` | `false` | Reveal the panel when new changes appear, without stealing focus |
+| `claudeChanges.autoOpenPanel` | `false` | Show the panel when new changes appear, without stealing focus |
+
+## What can't be identical to Cursor
+
+These are limits of VS Code's public extension API, not choices:
+
+- **No floating widgets inside an editor.** Cursor's floating `4 of 17 · Undo · Keep` box is a
+  CodeLens row plus a hover here.
+- **Fixed title-bar text.** Editor title-bar buttons can't show changing text such as
+  "2 of 19 Files", so that count is in the file bar and the status bar.
+- **Removed rows have no hover.** Only the inline diff editor can stack removed lines, so Keep /
+  Undo is on the change's first added line, or on the line where lines were removed.
+- **Panel badge.** It appears once the panel has been opened at least once.
 
 ## Limitations
 

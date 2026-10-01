@@ -3,16 +3,14 @@
 // VS Code's public API can't insert real "virtual" lines, so removed lines are shown with:
 //   • a red border line at the deletion point (+ a red "−" gutter icon for pure deletions),
 //   • red strikethrough ghost text at the end of that line summarizing the first removed line,
-//   • a hover with the complete removed block as a diff (plus Keep / Undo / Show links), and
+//   • a hover with the complete removed block (see hunkHover.ts), and
 //   • a CodeLens "▾ Show N removed" (see reviewCodeLens.ts) that opens the removed lines inline in a peek.
 
 import * as vscode from 'vscode';
-import { hunkFingerprint, Hunk } from '../core/hunks';
+import { Hunk } from '../core/hunks';
 import { pathKey } from '../core/manifest';
 import { ReviewService } from '../review/reviewService';
 import { config, hunkAnchorLine, isDeletionBelowLastLine, isInDiffEditor, plural, truncate } from './common';
-
-const MAX_HOVER_LINES = 60;
 
 export class InlineDecorations implements vscode.Disposable {
   private readonly added: vscode.TextEditorDecorationType;
@@ -136,20 +134,18 @@ export class InlineDecorations implements vscode.Disposable {
     const lineCount = doc.lineCount;
 
     for (const h of st.hunks) {
-      const hover = hoverFor(doc.uri, h);
       if (h.curLines.length) {
         const last = Math.min(h.curStart + h.curLines.length - 1, lineCount - 1);
-        added.push({ range: new vscode.Range(h.curStart, 0, last, 0), hoverMessage: hover });
+        added.push({ range: new vscode.Range(h.curStart, 0, last, 0) });
       }
       if (h.baseLines.length) {
         const line = hunkAnchorLine(h, lineCount);
         const range = doc.lineAt(line).range;
         const isBelow = isDeletionBelowLastLine(h, lineCount);
-        (isBelow ? below : above).push({ range, hoverMessage: hover });
+        (isBelow ? below : above).push({ range });
         if (!h.curLines.length) gutter.push({ range });
         ghost.push({
           range: new vscode.Range(range.end, range.end),
-          hoverMessage: hover,
           renderOptions: { after: { contentText: ghostText(h) } },
         });
       }
@@ -172,37 +168,4 @@ function ghostText(h: Hunk): string {
   const more = h.baseLines.length > 1 ? `   (${plural(h.baseLines.length, 'line')} removed)` : '';
   // Non-breaking spaces keep the leading gap from collapsing.
   return ` − ${truncate(first.trim(), 80)} ${more} `;
-}
-
-function commandLink(command: string, args: unknown[]): string {
-  return `command:${command}?${encodeURIComponent(JSON.stringify(args))}`;
-}
-
-function hoverFor(uri: vscode.Uri, h: Hunk): vscode.MarkdownString {
-  const md = new vscode.MarkdownString(undefined, true);
-  md.isTrusted = { enabledCommands: ['claudeChanges.keepHunk', 'claudeChanges.undoHunk', 'claudeChanges.showRemoved'] };
-  md.supportThemeIcons = true;
-  const fp = hunkFingerprint(h);
-  const args = [uri.toString(), fp];
-  const parts: string[] = [];
-  if (h.baseLines.length && h.curLines.length) {
-    parts.push(`**Claude changed ${plural(h.baseLines.length, 'line')} → ${plural(h.curLines.length, 'line')}**`);
-  } else if (h.baseLines.length) {
-    parts.push(`**Claude removed ${plural(h.baseLines.length, 'line')}**`);
-  } else {
-    parts.push(`**Claude added ${plural(h.curLines.length, 'line')}**`);
-  }
-  md.appendMarkdown(parts.join('') + '\n\n');
-  if (h.baseLines.length) {
-    const shown = h.baseLines.slice(0, MAX_HOVER_LINES).map((l) => `- ${l}`);
-    if (h.baseLines.length > MAX_HOVER_LINES) shown.push(`  … ${h.baseLines.length - MAX_HOVER_LINES} more`);
-    md.appendCodeblock(shown.join('\n'), 'diff');
-  }
-  const links = [
-    `[$(check) Keep](${commandLink('claudeChanges.keepHunk', args)})`,
-    `[$(discard) Undo](${commandLink('claudeChanges.undoHunk', args)})`,
-  ];
-  if (h.baseLines.length) links.push(`[$(eye) Show removed inline](${commandLink('claudeChanges.showRemoved', args)})`);
-  md.appendMarkdown(links.join(' &nbsp;·&nbsp; '));
-  return md;
 }

@@ -108,6 +108,50 @@ describe('computeHunks', () => {
   });
 });
 
+describe('ambiguous insertions/deletions are placed like VS Code places them', () => {
+  it('removes the whole indented block rather than straddling a closing tag', () => {
+    const base = [
+      '      </dl>',
+      '    </div>',
+      '    <div className="mt-6 bg-yellow p-5">',
+      '      <p>{venue.name}</p>',
+      '    </div>',
+      '    <p className="text-sm">{address}</p>',
+      '',
+    ].join('\n');
+    const cur = ['      </dl>', '    </div>', '    <p className="text-sm">{address}</p>', ''].join('\n');
+    expect(computeHunks(base, cur)).toEqual([
+      {
+        curStart: 2,
+        curLines: [],
+        baseStart: 2,
+        baseLines: ['    <div className="mt-6 bg-yellow p-5">', '      <p>{venue.name}</p>', '    </div>'],
+      },
+    ]);
+  });
+
+  it('places an inserted function after the closing brace, not inside it', () => {
+    const base = 'function a() {\n  return 1;\n}\n';
+    const cur = 'function a() {\n  return 1;\n}\n\nfunction b() {\n  return 2;\n}\n';
+    const [h] = computeHunks(base, cur);
+    expect(h.curLines[h.curLines.length - 1]).toBe('}');
+    expect(h.curLines[0]).toBe('');
+    expect(sameText(undoAll(base, cur), base)).toBe(true);
+  });
+
+  it('never moves a hunk into its neighbour', () => {
+    const base = 'x\nx\nx\ny\nx\nx\n';
+    const cur = 'x\nx\ny\nx\n';
+    const hunks = computeHunks(base, cur);
+    for (let i = 1; i < hunks.length; i++) {
+      expect(hunks[i].baseStart).toBeGreaterThanOrEqual(hunks[i - 1].baseStart + hunks[i - 1].baseLines.length);
+      expect(hunks[i].curStart).toBeGreaterThanOrEqual(hunks[i - 1].curStart + hunks[i - 1].curLines.length);
+    }
+    expect(sameText(undoAll(base, cur), base)).toBe(true);
+    expect(sameText(keepAll(base, cur), cur)).toBe(true);
+  });
+});
+
 describe('revert (per-hunk undo)', () => {
   const cases: [string, string, string][] = [
     ['middle', 'a\nb\nc\n', 'a\nB\nc\n'],
